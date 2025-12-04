@@ -97,7 +97,7 @@ class Instance:
                 logger.info("SIGTERM to pid %s", self.proc.pid)
                 self.proc.terminate()  # sends SIGTERM
             except Exception as e:
-                logger.exception("Error terminate: %s", e)
+                logger.error("Error terminate: %s", e)
             # wait up to grace seconds
             try:
                 self.proc.wait(timeout=grace)
@@ -106,11 +106,11 @@ class Instance:
                 try:
                     os.kill(self.proc.pid, 9)
                 except Exception as e:
-                    logger.exception("Error kill: %s", e)
+                    logger.error("Error kill: %s", e)
                 try:
                     self.proc.wait(timeout=5)
                 except Exception:
-                    logger.exception("Process still alive after kill")
+                    logger.error("Process still alive after kill")
             finally:
                 self.proc = None
 
@@ -122,7 +122,7 @@ class Launcher:
         self.instances = []
         self.stop_event = threading.Event()
         self.monitor_thread = None
-        self.updater_thread = None
+        self.last_update_check = 0.0
         self.instances_lock = threading.Lock()
         self.load_instances()
         self.current_sha = self.compute_local_sha()
@@ -146,13 +146,16 @@ class Launcher:
         try:
             return sha256_of_file(self.exec_path)
         except Exception as e:
-            logger.exception("Error computing local SHA: %s", e)
+            logger.error("Error computing local SHA: %s", e)
             return None
 
     def start_all(self):
         with self.instances_lock:
             for inst in self.instances:
-                inst.start()
+                try:
+                    inst.start()
+                except Exception as e:
+                    logger.error("Error starting instance: %s", e)
 
     def stop_all(self):
         grace = self.cfg.get("stop_grace_s", 10)
@@ -162,11 +165,12 @@ class Launcher:
                 try:
                     inst.terminate(grace)
                 except Exception as e:
-                    logger.exception("Error stopping instance: %s", e)
+                    logger.error("Error stopping instance: %s", e)
 
     def monitor_loop(self):
         restart_delay = self.cfg.get("restart_delay_s", 5)
         while not self.stop_event.is_set():
+            self.check_for_update()
             with self.instances_lock:
                 for inst in self.instances:
                     if not inst.is_running():
@@ -177,17 +181,19 @@ class Launcher:
                                 break
                             inst.start()
                         except Exception as e:
-                            logger.exception("Error restarting instance: %s", e)
+                            logger.error("Error restarting instance: %s", e)
             time.sleep(1)
 
-    def updater_loop(self):
-        check_interval = self.cfg.get("check_interval_s", 60)
-        update_url = self.cfg["update_json_url"]
-        base_download = self.cfg.get("download_base_url", "")
-        while not self.stop_event.is_set():
+    def check_for_update(self):
+        check_interval = self.cfg["check_interval_s"]
+        now = time.time()
+        if now - self.last_update_check >= check_interval:
+            self.last_update_check = now
             try:
+                update_url = self.cfg["update_json_url"]
+                base_download = self.cfg["download_base_url"]
                 logger.info("Checking for update: %s", update_url)
-                with urllib.request.urlopen(update_url, timeout=30) as r:
+                with urllib.request.urlopen(update_url, timeout=10) as r:
                     if r.status != 200:
                         logger.warning("Update JSON status %s", r.status)
                     else:
@@ -205,13 +211,8 @@ class Launcher:
                         else:
                             logger.warning("Invalid JSON: missing 'sha256' or 'file'")
             except Exception as e:
-                logger.exception("Error checking update: %s", e)
-            # sleep with early exit
-            for _ in range(int(check_interval)):
-                if self.stop_event.is_set():
-                    break
-                time.sleep(1)
-
+                logger.error("Error checking update: %s", e)
+            
     def perform_update(self, download_url, expected_sha):
         logger.info("Update: downloading from %s", download_url)
         tmp_dir = tempfile.mkdtemp(prefix="launcher_update_")
@@ -239,7 +240,7 @@ class Launcher:
                 target.chmod(0o755)
                 logger.info("Replacement successful: %s", target)
             except Exception as e:
-                logger.exception("Error replacing binary: %s", e)
+                logger.error("Error replacing binary: %s", e)
                 # try to restore backup
                 if backup.exists():
                     os.replace(str(backup), str(target))
@@ -265,20 +266,15 @@ class Launcher:
         # start monitor thread
         self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
         self.monitor_thread.start()
-        # start updater
-        self.updater_thread = threading.Thread(target=self.updater_loop, daemon=True)
-        self.updater_thread.start()
 
     def stop(self):
         logger.info("Launcher stopping")
         self.stop_event.set()
         # stop instances
         self.stop_all()
-        # join threads
+        # join monitor thread
         if self.monitor_thread:
             self.monitor_thread.join(timeout=2)
-        if self.updater_thread:
-            self.updater_thread.join(timeout=2)
         logger.info("Launcher stopped.")
 
 # --- Signal handling ---
