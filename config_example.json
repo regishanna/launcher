@@ -1,5 +1,7 @@
 {
   "executable": "myprogram.exe",
+  "compressed_archive": null,
+  "extract_dir": "extracted",
   "instances_file": "instances.txt",
   "check_interval_s": 60,
   "restart_delay_s": 5,

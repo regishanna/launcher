@@ -6,6 +6,7 @@ Launcher: launch N instances, auto-restart, manage updates via HTTPS JSON.
 import ctypes
 import signal
 import os
+import stat
 import sys
 import time
 import json
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import subprocess
 import urllib.request
+import tarfile
 import logging
 import argparse
 from pathlib import Path
@@ -32,7 +34,9 @@ logger = logging.getLogger("launcher")
 
 # --- Load config ---
 DEFAULT_CONFIG = {
-    "executable": "myprogram.exe",
+    "executable": "myprogram.exe",  # in archive mode, path is relative to archive root
+    "compressed_archive": None,
+    "extract_dir": "extracted",
     "instances_file": "instances.txt",
     "check_interval_s": 1800,
     "restart_delay_s": 15,
@@ -65,6 +69,22 @@ def download_file(url, dst_path):
         with open(dst_path, "wb") as out:
             shutil.copyfileobj(resp, out)
     return dst_path
+
+def decompress_archive(archive_path, output_dir):
+    name = archive_path.name
+    tar_mode = None
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        tar_mode = "r:gz"
+    elif name.endswith(".tar.bz2") or name.endswith(".tbz2"):
+        tar_mode = "r:bz2"
+    elif name.endswith(".tar.xz") or name.endswith(".txz"):
+        tar_mode = "r:xz"
+    elif name.endswith(".tar.zst") or name.endswith(".tzst"):
+        tar_mode = "r:zst"
+    else:
+        raise ValueError(f"Unsupported archive format: {archive_path}")
+    with tarfile.open(archive_path, tar_mode) as t:
+        t.extractall(output_dir)
 
 # --- Process management ---
 def pdeathsig_kill():   # to ensure child dies if parent dies
@@ -118,7 +138,12 @@ class Instance:
 class Launcher:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.exec_path = Path(cfg["executable"]).resolve()
+        self.extract_dir = Path(cfg["extract_dir"]).resolve()
+        if cfg.get("compressed_archive"):
+            # in archive mode, executable path is relative to archive root
+            self.exec_path = self.extract_dir / Path(cfg["executable"])
+        else:
+            self.exec_path = Path(cfg["executable"]).resolve()
         self.instances = []
         self.stop_event = threading.Event()
         self.monitor_thread = None
@@ -141,10 +166,16 @@ class Launcher:
             logger.warning("instances_file %s not found. No instances loaded.", inst_file)
 
     def compute_local_sha(self):
-        if not self.exec_path.exists():
+        path_to_compute = None
+        compressed = self.cfg.get("compressed_archive")
+        if compressed:
+            path_to_compute = Path(compressed).resolve()
+        else:
+            path_to_compute = self.exec_path
+        if not path_to_compute.exists():
             return None
         try:
-            return sha256_of_file(self.exec_path)
+            return sha256_of_file(path_to_compute)
         except Exception as e:
             logger.error("Error computing local SHA: %s", e)
             return None
@@ -212,53 +243,62 @@ class Launcher:
                             logger.warning("Invalid JSON: missing 'sha256' or 'file'")
             except Exception as e:
                 logger.error("Error checking update: %s", e)
-            
+
+
     def perform_update(self, download_url, expected_sha):
         logger.info("Update: downloading from %s", download_url)
         tmp_dir = tempfile.mkdtemp(prefix="launcher_update_")
+
         try:
+            # download update file
             tmp_file = Path(tmp_dir) / ("new_exec.bin")
             download_file(download_url, tmp_file)
+
             # check sha
             got_sha = sha256_of_file(tmp_file)
             if got_sha != expected_sha:
                 logger.error("SHA mismatch: expected=%s, got=%s -- aborting", expected_sha, got_sha)
                 return False
+
             # stop instances
-            logger.info("Stopping instances before replacing binary")
+            logger.info("Stopping instances before update")
             self.stop_all()
-            # replace executable atomically
-            target = self.exec_path
-            backup = target.with_suffix(target.suffix + ".bak")
-            try:
-                if target.exists():
-                    logger.info("Creating backup %s", backup)
-                    os.replace(str(target), str(backup))  # atomic on same FS
-                # move new file in place
-                os.replace(str(tmp_file), str(target))
-                # ensure executable bit
-                target.chmod(0o755)
-                logger.info("Replacement successful: %s", target)
-            except Exception as e:
-                logger.error("Error replacing binary: %s", e)
-                # try to restore backup
-                if backup.exists():
-                    os.replace(str(backup), str(target))
-                    logger.info("Backup restored")
-                return False
-            finally:
-                # cleanup backup
-                if backup.exists():
-                    try:
-                        backup.unlink()
-                    except Exception:
-                        pass
+
+            archive = self.cfg.get("compressed_archive")
+            if archive:
+                # archive mode
+                archive_path = Path(archive).resolve()
+
+                # replace old archive
+                os.replace(tmp_file, archive_path)
+
+                # decompress
+                if self.extract_dir.exists():
+                    shutil.rmtree(self.extract_dir)
+                self.extract_dir.mkdir(parents=True)
+                logger.info("Decompressing archive to %s", self.extract_dir)
+                decompress_archive(archive_path, self.extract_dir)
+
+            else:
+                # single executable mode
+                # replace old executable
+                os.replace(tmp_file, self.exec_path)
+
+            # ensure executable bit for user is set
+            st = self.exec_path.stat()
+            new_mode = st.st_mode | stat.S_IXUSR
+            self.exec_path.chmod(new_mode)
+            logger.info("Replacement successful: %s", self.exec_path)
+
             # restart all
             logger.info("Restarting all instances with the new binary")
             self.start_all()
+
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
         return True
+
 
     def start(self):
         logger.info("Launcher starting")
@@ -274,7 +314,7 @@ class Launcher:
         self.stop_all()
         # join monitor thread
         if self.monitor_thread:
-            self.monitor_thread.join(timeout=2)
+            self.monitor_thread.join(timeout=5)
         logger.info("Launcher stopped.")
 
 # --- Signal handling ---
